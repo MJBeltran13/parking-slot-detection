@@ -15,6 +15,7 @@ def YoloAnnotationPair(annotation_line):
 
 class YoloDataGenerator(keras.utils.Sequence):
     def __init__(self, annotation_lines, input_shape, anchors, batch_size, num_classes, anchors_mask, do_aug):
+        super(YoloDataGenerator, self).__init__()
         self.annotation_lines = annotation_lines
         self.input_shape = input_shape
         self.batch_size = batch_size
@@ -22,7 +23,6 @@ class YoloDataGenerator(keras.utils.Sequence):
         self.anchors_mask = anchors_mask
         self.num_classes = num_classes
         self.num_samples = len(self.annotation_lines)
-        self.num_batches = int(np.ceil(self.num_samples / self.batch_size))
         self.num_scales = len(self.anchors_mask)
         self.do_aug = do_aug
 
@@ -43,7 +43,11 @@ class YoloDataGenerator(keras.utils.Sequence):
         # Generate data
         image_data, y_true = self.__data_generation(batch_indexes)
 
-        return [image_data, *y_true], np.zeros(self.batch_size)
+        # Convert y_true to numpy arrays
+        y_true = [np.array(y) for y in y_true]
+        
+        # Return as a tuple of arrays
+        return (image_data, *y_true), np.zeros(self.batch_size)
 
     def __data_generation(self, batch_indexes):
         """

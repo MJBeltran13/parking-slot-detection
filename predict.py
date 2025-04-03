@@ -173,9 +173,18 @@ class YoloDecode(object):
         image_data = resize_image(image, (self.input_shape[1], self.input_shape[0]), self.letterbox_image)
 
         # =====================================================================
-        #   Normalize the image
+        #   Normalize the image and ensure correct shape
         # =====================================================================
         image_data = preprocess_input(np.array(image_data, dtype='float32'))
+        
+        # Ensure the image has the correct shape (height, width, channels)
+        if len(image_data.shape) == 2:
+            # If grayscale, add channel dimension
+            image_data = np.expand_dims(image_data, axis=-1)
+        elif len(image_data.shape) == 1:
+            # If flattened, reshape to (height, width, channels)
+            image_data = np.reshape(image_data, (self.input_shape[0], self.input_shape[1], -1))
+            
         return image_data
 
     # =====================================================================

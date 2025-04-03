@@ -12,6 +12,7 @@ from dataloader.dataloader import YoloDataGenerator
 from utils.callbacks import ExponentDecayScheduler, LossHistory, ModelCheckpoint
 from utils.utils import *
 from configs import *
+import datetime
 
 # =======================================================
 # Set a seed value
@@ -115,6 +116,18 @@ def _main():
     # =======================================================
     weight_path = PATH_WEIGHT
 
+    # Check if weights file exists
+    if weight_path and not os.path.exists(weight_path):
+        print(f"\nError: Weights file not found at {weight_path}")
+        print("\nPlease follow these steps:")
+        print("1. Download YOLOv3 weights:")
+        print("   - Visit https://pjreddie.com/media/files/yolov3.weights")
+        print("   - Save the file to model_data/yolov3.weights")
+        print("\n2. Convert the weights to Keras format:")
+        print("   python convert.py model_data/yolov3.weights model_data/yolov3_ps.h5")
+        print("\n3. Then run this training script again")
+        return
+
     # =======================================================
     #   Directory to store the loss tracking and model weights
     # =======================================================
@@ -184,7 +197,6 @@ def _main():
     # =======================================================
     #   Create a yolo model
     # =======================================================
-    # model_body = yolo_body((None, None, 3), anchors_mask, num_classes)
     model_body = YOLOv3((None, None, 3), num_classes)
     print('Create YOLOv3 model with {} anchors and {} classes.'.format(num_anchors, num_classes))
 
@@ -194,15 +206,19 @@ def _main():
     if weight_path != '':
         assert weight_path.endswith('.h5'), 'Keras model or weights must be a .h5 file.'
         print('Load weights {}.'.format(weight_path))
-
         model_body.load_weights(weight_path, by_name=True, skip_mismatch=True)
 
     # =======================================================
     #   Construct model with loss layer
     # =======================================================
-    y_true = [Input(shape=(image_shape[0] // {0: 32, 1: 16, 2: 8}[l], image_shape[1] // {0: 32, 1: 16, 2: 8}[l],
-                           len(anchors_mask[l]), num_classes + 5)) for l in range(len(anchors_mask))]
-
+    # Create input tensors for the model
+    input_image = Input(shape=(None, None, 3))
+    y_true = [Input(shape=(None, None, len(anchors_mask[l]), num_classes + 5)) for l in range(len(anchors_mask))]
+    
+    # Get model outputs
+    model_outputs = model_body(input_image)
+    
+    # Create loss layer
     model_loss = Lambda(
         yolo_loss,
         output_shape=(1,),
@@ -214,143 +230,117 @@ def _main():
             'num_classes': num_classes,
             'loss_iou_thresh': loss_iou_thresh
         }
-    )([*model_body.output, *y_true])
+    )([*model_outputs, *y_true])
 
-    model = Model([model_body.input, *y_true], model_loss)
+    # Create the complete model
+    model = Model([input_image, *y_true], model_loss)
     model.summary()
 
     # =======================================================
     #   Callbacks
-    #   set the training parameters
-    #   logging indicates the storage address of tensorboard
-    #   checkpoint is used to set the details of weight saving, period is used to modify how many epochs are saved once
-    #   reduce_lr is used to set the way the learning rate decreases
-    #   early_stopping is used to set early stop, and val_loss will automatically end the training without falling for
-    #       many times, indicating that the model is basically converged
     # =======================================================
-    logging = TensorBoard(log_dir)
-    checkpoint = ModelCheckpoint(log_dir2 + 'ep{epoch:03d}-loss{loss:.3f}-val_loss{val_loss:.3f}.h5',
-                                 monitor='val_loss',
-                                 save_weights_only=True, save_best_only=True, period=10)
-    reduce_lr = ExponentDecayScheduler(decay_rate=0.94, verbose=1)
-    early_stopping = EarlyStopping(monitor='val_loss', min_delta=0, patience=10, verbose=1)
+    time_str = datetime.datetime.strftime(datetime.datetime.now(), '%Y_%m_%d_%H_%M_%S')
+    log_dir = os.path.join(log_dir, "loss_" + str(time_str))
+    logging = TensorBoard(log_dir=log_dir)
     loss_history = LossHistory(log_dir)
+    checkpoint_period = ModelCheckpoint(log_dir + 'ep{epoch:03d}-loss{loss:.3f}-val_loss{val_loss:.3f}.h5',
+                                     monitor='val_loss', save_weights_only=False, period=1)
+    reduce_lr = ExponentDecayScheduler(decay_rate=0.94, decay_steps=5, min_lr=1e-6, verbose=1)
+    early_stopping = EarlyStopping(monitor='val_loss', min_delta=0, patience=10, verbose=1)
 
     # =======================================================
     #   Freeze body
     # =======================================================
     if freeze_body:
-        freeze_layers = 184
-        for i in range(freeze_layers):
-            model_body.layers[i].trainable = False
-        print('Freeze the first {} layers of total {} layers.'.format(freeze_layers, len(model_body.layers)))
+        print('Freeze the first {} layers of total {} layers.'.format(184, len(model_body.layers)))
+        for i in range(184): model_body.layers[i].trainable = False
+        print('Freeze the first {} layers of total {} layers.'.format(184, len(model_body.layers)))
+    else:
+        print('Do not freeze any layers.')
+
+    for i in range(len(model.layers)):
+        model.layers[i].trainable = True
+    model.compile(optimizer=Adam(learning_rate=freeze_lr), loss={
+        'yolo_loss': lambda y_true, y_pred: y_pred
+    })
+    print('Unfreeze all layers.')
 
     # =======================================================
-    #   The backbone feature extraction network features are common, and freezing training can speed up training
-    #   Also prevents weights from being corrupted at the beginning of training
-    #   init_epoch is the starting generation
-    #   freeze_end_epoch is the epoch to freeze the training
-    #   unfreeze_end_epoch total training generation
-    #   Prompt OOM or insufficient video memory, please reduce the Batch_size
+    #   Data loaders
     # =======================================================
-    if True:
-        # =======================================================
-        #   Model compile
-        # =======================================================
-        model.compile(optimizer=Adam(learning_rate=freeze_lr, epsilon=1e-8),
-                      loss={'yolo_loss': lambda y_true, y_pred: y_pred})
+    train_lines = read_lines(train_annot_paths, train_data_paths)
+    if val_using == "VAL":
+        val_lines = read_lines(val_annot_paths, val_data_paths)
+    if val_using == "TRAIN":
+        val_lines = random.sample(train_lines, int(len(train_lines) * val_split))
+        train_lines = [line for line in train_lines if line not in val_lines]
 
-        # =======================================================
-        #   Annotation lines
-        # =======================================================
-        train_lines = read_lines(train_annot_paths, train_data_paths)
-        if val_using == "VAL":
-            val_lines = read_lines(val_annot_paths, val_data_paths)
-        if val_using == "TRAIN":
-            val_lines = random.sample(train_lines, int(len(train_lines) * val_split))
-            train_lines = [line for line in train_lines if line not in val_lines]
+    # Create data generators
+    train_dataloader = YoloDataGenerator(train_lines, image_shape, anchors, train_freeze_batch_size,
+                                       num_classes, anchors_mask, do_aug=False)
+    if val_using == "VAL" or val_using == "TRAIN":
+        val_dataloader = YoloDataGenerator(val_lines, image_shape, anchors, val_batch_size,
+                                         num_classes, anchors_mask, do_aug=False)
 
-        # =======================================================
-        #   Data loaders
-        # =======================================================
-        train_dataloader = YoloDataGenerator(train_lines, image_shape, anchors, train_freeze_batch_size,
-                                             num_classes, anchors_mask, do_aug=False)
-        if val_using == "VAL" or val_using == "TRAIN":
-            val_dataloader = YoloDataGenerator(val_lines, image_shape, anchors, val_batch_size,
-                                               num_classes, anchors_mask, do_aug=False)
+    # Get number of samples
+    num_train = len(train_lines)
+    num_val = len(val_lines) if val_using in ["VAL", "TRAIN"] else 0
 
-        # =======================================================
-        #   Model fit
-        # =======================================================
-        if val_using == "VAL" or val_using == "TRAIN":
-            print("Training with {} train samples and validating with {} val samples from {}."
-                  .format(len(train_lines), len(val_lines), val_using))
-            model.fit(
-                train_dataloader, steps_per_epoch=train_dataloader.__len__(),
-                validation_data=val_dataloader, validation_steps=val_dataloader.__len__(),
-                initial_epoch=init_epoch, epochs=freeze_end_epoch,
-                callbacks=[logging, checkpoint, reduce_lr, early_stopping, loss_history]
-            )
-        else:
-            print("Training with {} train samples without validation.".format(len(train_lines)))
-            model.fit(
-                train_dataloader, steps_per_epoch=train_dataloader.__len__(),
-                initial_epoch=init_epoch, epochs=freeze_end_epoch,
-                callbacks=[logging, checkpoint, reduce_lr, early_stopping, loss_history]
-            )
-
-        model.save_weights(log_dir2 + 'trained_weights_stage_1.h5')
-
-        # =======================================================
-        #   In case of early stopping, set freeze_end_epoch to number of epochs ran with freezed layers
-        #   This helps in continuous sequence of epoch numbers in early stopping situation
-        # =======================================================
-        if len(loss_history.losses) < freeze_end_epoch:
-            freeze_end_epoch = len(loss_history.losses)
+    batch_size = train_freeze_batch_size
+    print('Train on {} samples, val on {} samples, with batch size {}.'.format(num_train, num_val, batch_size))
+    if val_using == "VAL":
+        model.fit(
+            train_dataloader, steps_per_epoch=train_dataloader.__len__(),
+            validation_data=val_dataloader, validation_steps=val_dataloader.__len__(),
+            initial_epoch=init_epoch, epochs=freeze_end_epoch,
+            callbacks=[logging, checkpoint_period, reduce_lr, early_stopping, loss_history]
+        )
+    else:
+        model.fit(
+            train_dataloader, steps_per_epoch=train_dataloader.__len__(),
+            initial_epoch=init_epoch, epochs=freeze_end_epoch,
+            callbacks=[logging, checkpoint_period, reduce_lr, early_stopping, loss_history]
+        )
+    model.save(log_dir2 + 'trained_weights_stage_1.keras')
 
     # =======================================================
-    #   Unfreeze layers trainability
-    #   Continue training (if freeze_body is True)
+    #   Unfreeze phase training
     # =======================================================
     if freeze_body:
+        for i in range(len(model_body.layers)):
+            model_body.layers[i].trainable = True
+        print('Unfreeze all layers.')
+
         for i in range(len(model.layers)):
             model.layers[i].trainable = True
-        print('Unfreeze all the layers.')
-
-        # =======================================================
-        #   Recompile to apply the change
-        # =======================================================
-        model.compile(optimizer=Adam(learning_rate=unfreeze_lr, epsilon=1e-8),
-                      loss={'yolo_loss': lambda y_true, y_pred: y_pred})
-
-        # =======================================================
-        #   Data loaders
-        #   Note that more GPU memory is required after unfreezing the body
-        # =======================================================
+        model.compile(optimizer=Adam(learning_rate=unfreeze_lr), loss={
+            'yolo_loss': lambda y_true, y_pred: y_pred
+        })
+        print('Unfreeze and continue to train {} epochs.'.format(unfreeze_end_epoch))
+        
+        # Create data generators with new batch size
         train_dataloader = YoloDataGenerator(train_lines, image_shape, anchors, train_unfreeze_batch_size,
-                                             num_classes, anchors_mask, do_aug=False)
+                                           num_classes, anchors_mask, do_aug=False)
         if val_using == "VAL" or val_using == "TRAIN":
             val_dataloader = YoloDataGenerator(val_lines, image_shape, anchors, val_batch_size,
-                                               num_classes, anchors_mask, do_aug=False)
+                                             num_classes, anchors_mask, do_aug=False)
 
-        # =======================================================
-        #   Model fit
-        # =======================================================
-        if val_using == "VAL" or val_using == "TRAIN":
+        batch_size = train_unfreeze_batch_size
+        print('Train on {} samples, val on {} samples, with batch size {}.'.format(num_train, num_val, batch_size))
+        if val_using == "VAL":
             model.fit(
                 train_dataloader, steps_per_epoch=train_dataloader.__len__(),
                 validation_data=val_dataloader, validation_steps=val_dataloader.__len__(),
                 initial_epoch=freeze_end_epoch, epochs=unfreeze_end_epoch,
-                callbacks=[logging, checkpoint, reduce_lr, early_stopping, loss_history]
+                callbacks=[logging, checkpoint_period, reduce_lr, early_stopping, loss_history]
             )
         else:
             model.fit(
                 train_dataloader, steps_per_epoch=train_dataloader.__len__(),
                 initial_epoch=freeze_end_epoch, epochs=unfreeze_end_epoch,
-                callbacks=[logging, checkpoint, reduce_lr, early_stopping, loss_history]
+                callbacks=[logging, checkpoint_period, reduce_lr, early_stopping, loss_history]
             )
-
-        model.save_weights(log_dir2 + 'trained_weights_final.h5')
+        model.save(log_dir2 + 'trained_weights_final.keras')
 
 
 if __name__ == '__main__':
